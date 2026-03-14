@@ -803,6 +803,22 @@ def write_manifest(output_dir: str, cfg: Config, families: list[str]) -> None:
 BAZAAR_API = "https://mb-api.abuse.ch/api/v1/"
 
 
+def _is_pe_or_elf_sample(sample: dict) -> bool:
+    """Best-effort PE/ELF filter tolerant to API field variations."""
+    haystack = " ".join([
+        str(sample.get("file_type", "")),
+        str(sample.get("file_type_mime", "")),
+        str(sample.get("file_information", "")),
+        str(sample.get("file_name", "")),
+    ]).lower()
+
+    binary_markers = (
+        "exe", "dll", "elf", "pe32", "pe32+", "win32 exe", "win64 exe",
+        "x-dosexec", "x-executable", "x-sharedlib", "application/x-msdownload",
+    )
+    return any(marker in haystack for marker in binary_markers)
+
+
 async def _query_bazaar_async(
     session: "aiohttp.ClientSession",
     tag: str,
@@ -812,6 +828,8 @@ async def _query_bazaar_async(
     for query_type in ("get_taginfo", "get_siginfo"):
         key   = "tag" if query_type == "get_taginfo" else "signature"
         data  = {"query": query_type, key: tag, "limit": limit}
+        if CFG.bazaar_api_key:
+            data["apikey"] = CFG.bazaar_api_key
         delay = 1.0
         for attempt in range(CFG.max_retries):
             try:
@@ -906,12 +924,7 @@ async def _download_family_async(
     ctx_log("info", f"[{family}] Querying MalwareBazaar...", "downloader")
     samples = await _query_bazaar_async(session, family)
 
-    pe_elf = [
-        s for s in samples
-        if s.get("file_type", "").lower() in
-           ("exe","dll","elf","pe32","pe32+","win32 exe","win64 exe")
-           or str(s.get("file_name","")).lower().endswith((".exe",".dll",".elf"))
-    ]
+    pe_elf = [s for s in samples if _is_pe_or_elf_sample(s)]
 
     if len(pe_elf) < 3:
         ctx_log("warning", f"[{family}] Only {len(pe_elf)} PE/ELF samples — skip", "downloader")
@@ -1009,14 +1022,13 @@ def download_all_families(data_root: str, output_dir: str, families: list[str], 
         downloaded = fam_state.get("downloaded", 0)
         for query_type, key in (("get_taginfo","tag"),("get_siginfo","signature")):
             try:
-                r = requests.post(BAZAAR_API, data={"query":query_type, key:family, "limit":100}, timeout=30)
+                q_data = {"query":query_type, key:family, "limit":100}
+                if CFG.bazaar_api_key:
+                    q_data["apikey"] = CFG.bazaar_api_key
+                r = requests.post(BAZAAR_API, data=q_data, timeout=30)
                 data = r.json()
                 if data.get("query_status") == "ok" and data.get("data"):
-                    pe_elf = [
-                        s for s in data["data"]
-                        if s.get("file_type","").lower() in
-                           ("exe","dll","elf","pe32","pe32+","win32 exe","win64 exe")
-                    ]
+                    pe_elf = [s for s in data["data"] if _is_pe_or_elf_sample(s)]
                     fam_dir.mkdir(exist_ok=True)
                     for sample in pe_elf[:target + 5]:
                         if downloaded >= target:
