@@ -803,31 +803,71 @@ def write_manifest(output_dir: str, cfg: Config, families: list[str]) -> None:
 BAZAAR_API = "https://mb-api.abuse.ch/api/v1/"
 
 
+def _is_pe_or_elf_sample(sample: dict) -> bool:
+    """Best-effort PE/ELF filter tolerant to API field variations."""
+    haystack = " ".join([
+        str(sample.get("file_type", "")),
+        str(sample.get("file_type_mime", "")),
+        str(sample.get("file_information", "")),
+        str(sample.get("file_name", "")),
+    ]).lower()
+
+    binary_markers = (
+        "exe", "dll", "elf", "pe32", "pe32+", "win32 exe", "win64 exe",
+        "x-dosexec", "x-executable", "x-sharedlib", "application/x-msdownload",
+    )
+    return any(marker in haystack for marker in binary_markers)
+
+
+def _family_query_variants(family: str) -> list[str]:
+    """Generate deduplicated query variants for better MalwareBazaar matching."""
+    cleaned = re.sub(r"[^a-z0-9]+", "", family.lower())
+    variants = [
+        family,
+        family.lower(),
+        family.upper(),
+        family.title(),
+        cleaned,
+    ]
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in variants:
+        if not v:
+            continue
+        k = v.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(v)
+    return out
+
+
 async def _query_bazaar_async(
     session: "aiohttp.ClientSession",
-    tag: str,
+    family: str,
     limit: int = 100
 ) -> list[dict]:
-    """Query MalwareBazaar by tag, then by signature, with exponential backoff."""
-    for query_type in ("get_taginfo", "get_siginfo"):
-        key   = "tag" if query_type == "get_taginfo" else "signature"
-        data  = {"query": query_type, key: tag, "limit": limit}
-        delay = 1.0
-        for attempt in range(CFG.max_retries):
-            try:
-                async with session.post(BAZAAR_API, data=data, timeout=aiohttp.ClientTimeout(total=30)) as r:
-                    if r.status == 429:
-                        await asyncio.sleep(delay)
-                        delay *= 2
-                        continue
-                    j = await r.json(content_type=None)
-                    if j.get("query_status") == "ok" and j.get("data"):
-                        return j["data"]
-                    break
-            except Exception as e:
-                ctx_log("debug", f"Query attempt {attempt+1} failed for '{tag}': {e}", "downloader")
-                await asyncio.sleep(delay)
-                delay *= 2
+    """Query MalwareBazaar by tag/signature using normalized family variants."""
+    for variant in _family_query_variants(family):
+        for query_type in ("get_taginfo", "get_siginfo"):
+            key = "tag" if query_type == "get_taginfo" else "signature"
+            data = {"query": query_type, key: variant, "limit": limit}
+            delay = 1.0
+            for attempt in range(CFG.max_retries):
+                try:
+                    async with session.post(BAZAAR_API, data=data, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                        if r.status == 429:
+                            await asyncio.sleep(delay)
+                            delay *= 2
+                            continue
+                        j = await r.json(content_type=None)
+                        if j.get("query_status") == "ok" and j.get("data"):
+                            return j["data"]
+                        break
+                except Exception as e:
+                    ctx_log("debug", f"Query attempt {attempt+1} failed for '{variant}': {e}", "downloader")
+                    await asyncio.sleep(delay)
+                    delay *= 2
+    ctx_log("warning", f"[{family}] No results from MalwareBazaar (all variants exhausted)", "downloader")
     return []
 
 
@@ -905,13 +945,11 @@ async def _download_family_async(
 
     ctx_log("info", f"[{family}] Querying MalwareBazaar...", "downloader")
     samples = await _query_bazaar_async(session, family)
+    if not samples:
+        state[fam_key] = {"downloaded": 0, "done": False, "skipped": True}
+        return 0
 
-    pe_elf = [
-        s for s in samples
-        if s.get("file_type", "").lower() in
-           ("exe","dll","elf","pe32","pe32+","win32 exe","win64 exe")
-           or str(s.get("file_name","")).lower().endswith((".exe",".dll",".elf"))
-    ]
+    pe_elf = [s for s in samples if _is_pe_or_elf_sample(s)]
 
     if len(pe_elf) < 3:
         ctx_log("warning", f"[{family}] Only {len(pe_elf)} PE/ELF samples — skip", "downloader")
@@ -1009,14 +1047,16 @@ def download_all_families(data_root: str, output_dir: str, families: list[str], 
         downloaded = fam_state.get("downloaded", 0)
         for query_type, key in (("get_taginfo","tag"),("get_siginfo","signature")):
             try:
-                r = requests.post(BAZAAR_API, data={"query":query_type, key:family, "limit":100}, timeout=30)
-                data = r.json()
+                for variant in _family_query_variants(family):
+                    q_data = {"query":query_type, key:variant, "limit":100}
+                    r = requests.post(BAZAAR_API, data=q_data, timeout=30)
+                    data = r.json()
+                    if data.get("query_status") == "ok" and data.get("data"):
+                        break
+                else:
+                    data = {}
                 if data.get("query_status") == "ok" and data.get("data"):
-                    pe_elf = [
-                        s for s in data["data"]
-                        if s.get("file_type","").lower() in
-                           ("exe","dll","elf","pe32","pe32+","win32 exe","win64 exe")
-                    ]
+                    pe_elf = [s for s in data["data"] if _is_pe_or_elf_sample(s)]
                     fam_dir.mkdir(exist_ok=True)
                     for sample in pe_elf[:target + 5]:
                         if downloaded >= target:
@@ -1063,6 +1103,9 @@ def download_all_families(data_root: str, output_dir: str, families: list[str], 
                     break
             except Exception:
                 pass
+
+        if downloaded == 0:
+            ctx_log("warning", f"[{family}] No results from MalwareBazaar (all variants exhausted)", "downloader")
 
         done = downloaded >= target
         state[fam_key] = {"downloaded": downloaded, "done": done}
